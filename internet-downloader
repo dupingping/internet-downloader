@@ -1,0 +1,246 @@
+#!/usr/bin/python
+
+import urllib2
+import thread
+import time
+import os
+
+maxThreadCount = 8
+minimumsegsize = 65536
+
+#every_thread: start offset, size, current
+thread_status = {}
+thread_global_index = 0
+thread_status_lock = thread.allocate_lock()
+
+destfd = None
+destfd_lock = thread.allocate_lock()
+
+openurl_lock = thread.allocate_lock()
+write_lock = thread.allocate_lock()
+
+srcFile = ""
+dstFile = ""
+
+def openurl(url, offset, size):
+    rc = None
+    req = None
+
+    if offset == 0 and size == 0:
+#	req = urllib2.Request(url)
+	hdr = { 'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+		'Accept-Encoding':'gzip,deflate,sdch',
+		'Accept-Language':'en-US,en;q=0.8',
+		'Connection':'keep-alive',
+		'User-Agent':'Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/38.0.2125.104 Safari/537.36' }
+	req = urllib2.Request(url, headers=hdr)
+    else:
+	hdr = { 'Range':'bytes=%d-%d' % (offset, offset + size), 
+		'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+		'Accept-Encoding':'gzip,deflate,sdch',
+		'Accept-Language':'en-US,en;q=0.8',
+		'Connection':'keep-alive',
+		'User-Agent':'Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/38.0.2125.104 Safari/537.36' }
+
+	req = urllib2.Request(url, headers=hdr)
+    rc = urllib2.urlopen(req)
+
+    return rc
+
+def parse_options():
+    global srcFile
+    global dstFile
+    global maxThreadCount
+    global destfd
+
+    if len(os.sys.argv) > 1:
+	srcFile = os.sys.argv[1]
+
+    if not srcFile:
+	print "Usage: %s <url> [threadcount] [target filename]" % (os.sys.argv[0])
+	os.sys.exit(0)
+
+    if len(os.sys.argv) > 2:
+	maxThreadCount = int(os.sys.argv[2])
+
+    if len(os.sys.argv) > 3:
+	dstFile = os.sys.argv[3]
+    else:
+	dstFile = os.path.basename(srcFile)
+
+    destfd = open(dstFile, "w")
+
+def done():
+    destfd.close()
+
+def writeTo(ix, buf):
+    global destfd
+
+    thread_status_lock.acquire()
+    current = thread_status[ix]['current']
+    size = thread_status[ix]['size']
+    thread_status_lock.release()
+
+    if len(buf) > size - current:
+	buf = buf[:size - current]
+
+    destfd_lock.acquire()
+    destfd.seek(current)
+    destfd.write(buf)
+    destfd_lock.release()
+
+    current += len(buf)
+    if current == size:
+	return 0
+
+    thread_status_lock.acquire()
+    thread_status[ix]['current'] = current
+    thread_status_lock.release()
+
+#    print ix, len(buf)
+
+    return 1
+
+def download_thread(ix):
+    thread_status_lock.acquire()
+    fd = thread_status[ix]['fd']
+    thread_status_lock.release()
+    while 1:
+	buf = fd.read(32768)
+	if len(buf) == 0:
+	    print "readed buf error retry"
+	    time.sleep(1)
+	    continue
+	    break
+
+	if writeTo(ix, buf) == 0:
+	    break
+
+    fd.close()
+    thread_status_lock.acquire()
+    thread_status[ix]['fd'] = None
+    thread_status_lock.release()
+    create_thread(ix)
+
+def create_thread(parentIx):
+    global srcFile
+    global thread_global_index
+
+    thread_status_lock.acquire()
+
+    maxix = -1
+
+    for ix in thread_status:
+	if maxix == -1:
+	    maxix = ix
+	    continue
+
+	if (thread_status[ix]['size'] - thread_status[ix]['current']) > (thread_status[maxix]['size'] - thread_status[maxix]['current']):
+	    maxix = ix
+
+    ix = maxix
+
+    nextthread = {}
+    nextthread['start'] = (((thread_status[ix]['current'] + thread_status[ix]['size']) / 2 - 1 + minimumsegsize) / minimumsegsize * minimumsegsize)
+    if (nextthread['start'] + 65536 > thread_status[ix]['size']) or (nextthread['start'] - 65536 < thread_status[ix]['current']):
+	thread_status_lock.release()
+	if parentIx != -1:
+	    thread_status.pop(parentIx)
+	return
+
+    nextthread['size'] = thread_status[ix]['size']
+    nextthread['total'] = thread_status[ix]['total']
+
+
+    nextthread['current'] = nextthread['start']
+    thread_status[ix]['size'] = nextthread['start']
+    thread_global_index += 1
+    currentIx = thread_global_index
+    thread_status[currentIx] = nextthread
+
+    thread_status_lock.release()
+
+    openurl_lock.acquire()
+    try:
+	print "createing ", srcFile, nextthread['start'], nextthread['total']
+	rc = openurl(srcFile, nextthread['start'], nextthread['total'])
+    except:
+	rc = None
+    openurl_lock.release()
+
+    if not rc:
+	print "could not open %s %d %d" % (srcFile, nextthread['start'], nextthread['total'])
+	return
+
+    thread_status_lock.acquire()
+
+#    thread_status[ix]['size'] = nextthread['start']
+#    thread_global_index += 1
+#    currentIx = thread_global_index
+#    thread_status[currentIx] = nextthread
+
+    thread_status[currentIx]['fd'] = rc
+    if parentIx != -1:
+	thread_status.pop(parentIx)
+    thread_status_lock.release()
+    download_thread(currentIx)
+
+def create_first_thread():
+    global srcFile
+
+    rc = openurl(srcFile, 0, 0)
+    size = int(rc.headers['Content-Length'])
+    thread_status_lock.acquire()
+    thread_status[0] = {'fd':rc, 'start':0, 'size':size, 'total':size, 'current':0}
+    thread_status_lock.release()
+
+    thread.start_new_thread(download_thread, (0, ))
+
+if __name__ == "__main__":
+    lTime = time.time()
+    beginTime = lTime
+    parse_options()
+    create_first_thread()
+
+    for i in range(maxThreadCount - 1):
+	print "thread:", i
+	thread.start_new_thread(create_thread, (-1, ))
+
+    rSize = -1
+    lastRSize = 0
+    totalSize = 0
+
+    while 1:
+	thread_status_lock.acquire()
+	if rSize == -1:
+	    lastRSize = thread_status[0]['total']
+	    totalSize = lastRSize
+	rSize = 0
+	running = 0
+	for i in thread_status:
+	    rSize += thread_status[i]['size'] - thread_status[i]['current']
+	    if 'fd' in thread_status[i] and thread_status[i]['fd']:
+		running += 1
+
+	if len(thread_status) == 0:
+	    thread_status_lock.release()
+	    break
+
+	cTime = time.time()
+	speed = float(lastRSize - rSize) / float(cTime - lTime)
+	lTime = cTime
+
+	print "- threads:%d(%d)" % (len(thread_status), running)
+	for i in thread_status:
+	    print "\tthread:%d %d-%d" % (i, thread_status[i]['current'], thread_status[i]['size'])
+
+	remainTime = "Calculating"
+	if totalSize - rSize:
+	    remainTime = "%d s" % ((cTime - beginTime) / (totalSize - rSize) * rSize)
+
+	print "- %d B/s progressed: %d%% AVGSpeed(%d B/s) RemainTime(%s)" % (speed, ((totalSize - rSize) * 100 / totalSize), (totalSize - rSize) / (cTime - beginTime), remainTime)
+	thread_status_lock.release()
+	time.sleep(1)
+	lastRSize = rSize
+
+    done()
